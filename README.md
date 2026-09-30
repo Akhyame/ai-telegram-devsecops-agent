@@ -69,6 +69,32 @@ The GitLab projects and linked traces are **private**; readers without access ma
 
 An intermittent `/status` issue was investigated and subsequent spot checks succeeded. The separate deployment-completion notification was not observed in Telegram and remains an open follow-up; the successful CI deployment job should not be confused with confirmation of Telegram delivery.
 
+## Visual evidence
+
+### Architecture
+
+![AI Telegram DevSecOps Agent architecture](docs/screenshots/00_architecture_diagram.png)
+
+### Telegram control
+
+![Telegram commands and pipeline status](docs/screenshots/01_telegram_help_status.png)
+
+### CI/CD and security validation
+
+![Agent pipeline overview](docs/screenshots/02_agent_pipeline_overview.png)
+
+![Deterministic Security Gate ALLOW](docs/screenshots/04_security_gate_allow.png)
+
+### Monitoring and runtime
+
+![Telegram FIRING and RESOLVED alerts](docs/screenshots/08_monitoring_firing_resolved_telegram.png)
+
+![Healthy staging services](docs/screenshots/09_staging_services_healthy.png)
+
+![Real FastAPI Swagger UI](docs/screenshots/10_real_fastapi_swagger_ui.png)
+
+See the [complete screenshot evidence gallery](docs/screenshots/README.md) for the full curated set.
+
 ## Development and reproducibility
 
 The implementation uses **Python 3.12**, **FastAPI**, **Docker / Compose**, **GitLab Runner** and an Ubuntu Server 24.04 lab VM. From the project root, the local quality and test checks can be run with:
