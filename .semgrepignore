@@ -1,0 +1,36 @@
+# Preserve Semgrep's built-in default ignore set explicitly because a root
+# .semgrepignore replaces the built-in defaults. Dockerfile is additionally
+# excluded here because container and Dockerfile security are covered by Trivy.
+
+# Administrative folder or file used by popular version control systems
+.git
+.svn
+.hg
+_darcs
+CVS
+
+# Paths to files and folders that are typically large and ignorable
+build/
+vendor/
+dist/
+*.min.js
+.env/
+.tox/
+
+# Package managers
+node_modules/
+.npm/
+.yarn/
+.venv/
+_opam/
+_build/
+_cargo/
+
+# Common test paths
+test/
+tests/
+testsuite/
+*_test.go
+
+# Container definition is scanned by Trivy filesystem misconfiguration and image scans.
+Dockerfile

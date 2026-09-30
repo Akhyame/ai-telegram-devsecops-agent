@@ -1,0 +1,21 @@
+name: ai-devsecops-staging
+
+services:
+  api:
+    env_file:
+      - path: "${STAGING_API_ENV_FILE:?STAGING_API_ENV_FILE is required}"
+        required: true
+    environment:
+      SAMPLE_APP_ENVIRONMENT: staging
+      SAMPLE_APP_LOG_LEVEL: INFO
+      STAGING_SITE_URL: "${STAGING_SITE_URL:-http://127.0.0.1:18001/}"
+    ports:
+      - target: 8000
+        published: "18000"
+        host_ip: 127.0.0.1
+        protocol: tcp
+
+  bot:
+    env_file:
+      - path: "${STAGING_BOT_ENV_FILE:?STAGING_BOT_ENV_FILE is required}"
+        required: true

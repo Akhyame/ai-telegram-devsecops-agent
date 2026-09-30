@@ -1,0 +1,20 @@
+name: ai-devsecops-production
+
+services:
+  api:
+    env_file:
+      - path: "${PRODUCTION_API_ENV_FILE:?PRODUCTION_API_ENV_FILE is required}"
+        required: true
+    environment:
+      SAMPLE_APP_ENVIRONMENT: production
+      SAMPLE_APP_LOG_LEVEL: INFO
+    ports:
+      - target: 8000
+        published: "8000"
+        host_ip: 127.0.0.1
+        protocol: tcp
+
+  bot:
+    env_file:
+      - path: "${PRODUCTION_BOT_ENV_FILE:?PRODUCTION_BOT_ENV_FILE is required}"
+        required: true

@@ -1,0 +1,12 @@
+title = "AI Telegram DevSecOps Agent Gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Ignore one historical synthetic GitLab PAT test fixture"
+targetRules = ["gitlab-pat"]
+condition = "AND"
+regexTarget = "line"
+regexes = ['''glpat-EXAMPLE-NOT-A-REAL-TOKE[N]''']
+paths = ['''^tests/test_agent_security_client\.py$''']

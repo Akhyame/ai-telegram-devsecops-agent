@@ -1,0 +1,548 @@
+spec:
+  inputs:
+    pipeline_profile:
+      type: string
+      default: full
+      options:
+        - full
+        - security
+      description: "Select the fixed pipeline execution profile."
+    deployment_environment:
+      type: string
+      default: none
+      options:
+        - none
+        - staging
+        - production
+      description: "Select one explicitly approved deployment environment."
+---
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - when: never
+
+default:
+  image: "python:3.12-slim-bookworm@sha256:a116514e19457bcb7af7efe9c3dd0b9b71e85b317694e7882a1c52aa15a78134"
+  tags:
+    - ai-devsecops
+    - docker
+  interruptible: true
+
+variables:
+  GIT_STRATEGY: clone
+  GIT_DEPTH: "20"
+  AGENT_BASE_IMAGE: "python:3.12-slim-bookworm@sha256:a116514e19457bcb7af7efe9c3dd0b9b71e85b317694e7882a1c52aa15a78134"
+
+stages:
+  - verify
+  - quality
+  - test
+  - security
+  - build
+  - image_scan
+  - security_gate
+  - deployment_validate
+  - deploy
+  - monitoring_deploy
+
+runner_connectivity:
+  stage: verify
+  script:
+    - python --version
+    - test "$CI" = "true"
+    - test -n "$CI_PROJECT_PATH"
+    - test -n "$CI_COMMIT_SHA"
+    - test -n "$CI_RUNNER_ID"
+    - printf "Runner_smoke passed project=%s runner_id=%s\n" "$CI_PROJECT_PATH" "$CI_RUNNER_ID"
+
+.python_pip_cache:
+  variables:
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+    PIP_TIMEOUT: "120"
+    PIP_RETRIES: "10"
+  cache:
+    key: "pip-v2-${CI_COMMIT_REF_SLUG}-${CI_JOB_NAME_SLUG}"
+    paths:
+      - .cache/pip/
+    policy: pull-push
+
+.python_dev_job:
+  extends: .python_pip_cache
+  before_script:
+    - python -m pip install ".[dev]"
+
+ruff_quality:
+  extends: .python_dev_job
+  stage: quality
+  rules:
+    - if: '"$[[ inputs.pipeline_profile ]]" == "security"'
+      when: never
+    - when: on_success
+  script:
+    - python -m ruff format --check .
+    - python -m ruff check .
+
+unit_tests:
+  extends: .python_dev_job
+  stage: test
+  rules:
+    - if: '"$[[ inputs.pipeline_profile ]]" == "security"'
+      when: never
+    - when: on_success
+  script:
+    - python -m pytest -q -W error --junitxml=pytest-report.xml
+  artifacts:
+    when: always
+    reports:
+      junit: pytest-report.xml
+    paths:
+      - pytest-report.xml
+    expire_in: 1 week
+secret_scan:
+  stage: security
+  image:
+    name: "ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:b109bc5f8f76a38196a3e413704fc5b9e3c32360bce4e4b603bd6f45b3721dbb"
+    entrypoint: [""]
+  variables:
+    GIT_DEPTH: "0"
+  script:
+    - gitleaks git --exit-code 0 --redact --verbose --report-format json --report-path gitleaks-report.json .
+  artifacts:
+    when: always
+    paths:
+      - gitleaks-report.json
+    expire_in: 1 week
+dependency_scan:
+  extends: .python_pip_cache
+  stage: security
+  before_script:
+    - python -m pip install "pip-audit==2.10.1"
+  script:
+    - |
+      set -eu
+
+      AUDIT_TARGET="$(mktemp -d)"
+      export AUDIT_TARGET
+
+      cleanup() {
+        rm -rf "$AUDIT_TARGET"
+      }
+
+      trap cleanup EXIT
+
+      python -m pip install \
+        --target "$AUDIT_TARGET" \
+        .
+
+      python - <<'PY'
+      import os
+      from pathlib import Path
+
+      target = Path(os.environ["AUDIT_TARGET"])
+      matches = list(
+          target.glob("ai_telegram_devsecops_agent-*.dist-info")
+      )
+
+      if len(matches) != 1:
+          raise SystemExit(
+              f"Expected one local project metadata directory, "
+              f"found {len(matches)}"
+          )
+
+      metadata = matches[0]
+      metadata.rename(
+          metadata.with_name(f"{metadata.name}.audit-disabled")
+      )
+      PY
+
+      audit_exit_code=0
+
+      python -m pip_audit \
+        --strict \
+        --progress-spinner off \
+        --path "$AUDIT_TARGET" \
+        --format json \
+        --output pip-audit-report.json || audit_exit_code=$?
+
+      if [ "$audit_exit_code" -eq 1 ]; then
+        python - <<'PY'
+      from policy_engine import load_pip_audit_report
+
+      findings = load_pip_audit_report("pip-audit-report.json")
+
+      if not findings:
+          raise SystemExit(
+              "pip-audit exited with code 1 without vulnerability findings"
+          )
+      PY
+      elif [ "$audit_exit_code" -ne 0 ]; then
+        exit "$audit_exit_code"
+      fi
+  artifacts:
+    when: always
+    paths:
+      - pip-audit-report.json
+    expire_in: 1 week
+sast_scan:
+  extends: .python_pip_cache
+  stage: security
+  before_script:
+    - python -m pip install "wrapt==1.17.3"
+    - python -m pip install "semgrep==1.174.0"
+  script:
+    - |
+      semgrep scan \
+        --config "p/default" \
+        --exclude ".cache/" \
+        --metrics off \
+        --disable-version-check \
+        --json-output semgrep-report.json \
+        .
+  artifacts:
+    when: always
+    paths:
+      - semgrep-report.json
+    expire_in: 1 week
+.trivy_cache:
+  variables:
+    TRIVY_CACHE_DIR: "$CI_PROJECT_DIR/.trivycache"
+  cache:
+    key: "trivy-${CI_COMMIT_REF_SLUG}"
+    paths:
+      - .trivycache/
+    policy: pull-push
+
+trivy_filesystem_scan:
+  extends: .trivy_cache
+  stage: security
+  image:
+    name: "aquasec/trivy@sha256:ee940acbf1f58ebadb42d01434ce4609530bf1b52536afbd1eee66cd7123c5c9"
+    entrypoint: [""]
+  script:
+    - |
+      trivy filesystem \
+        --timeout 30m \
+        --skip-dirs "$TRIVY_CACHE_DIR" \
+        --scanners vuln,misconfig \
+        --exit-code 0 \
+        --no-progress \
+        --disable-telemetry \
+        --format json \
+        --output trivy-filesystem-report.json \
+        .
+  artifacts:
+    when: always
+    paths:
+      - trivy-filesystem-report.json
+    expire_in: 1 week
+container_image:
+  stage: build
+  image:
+    name: "moby/buildkit:v0.24.0-rootless@sha256:995077ff90af1afff56ff23018699d7511d122b2b111041f2011bd12afd5c0fe"
+    entrypoint: [""]
+  tags:
+    - saas-linux-small-amd64
+  variables:
+    BUILDKITD_FLAGS: "--oci-worker-no-process-sandbox"
+  before_script:
+    - mkdir -p "$HOME/.docker"
+    - |
+      printf '{"auths":{"%s":{"username":"%s","password":"%s"}}}' \
+        "$CI_REGISTRY" "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" \
+        > "$HOME/.docker/config.json"
+  script:
+    - |
+      buildctl-daemonless.sh build \
+        --frontend dockerfile.v0 \
+        --local context=. \
+        --local dockerfile=. \
+        --opt platform=linux/amd64 \
+        --output "type=image,name=${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHA},push=true"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+trivy_image_scan:
+  extends: .trivy_cache
+  stage: image_scan
+  image:
+    name: "aquasec/trivy@sha256:ee940acbf1f58ebadb42d01434ce4609530bf1b52536afbd1eee66cd7123c5c9"
+    entrypoint: [""]
+  needs:
+    - container_image
+  before_script:
+    - |
+      printf '%s' "$CI_REGISTRY_PASSWORD" |
+        trivy registry login \
+          --username "$CI_REGISTRY_USER" \
+          --password-stdin \
+          "$CI_REGISTRY"
+  script:
+    - |
+      set -eu
+
+      expected_from="FROM ${AGENT_BASE_IMAGE}"
+      actual_from="$(grep -m1 '^FROM python:' Dockerfile)"
+
+      if [ "$actual_from" != "$expected_from" ]; then
+        echo "Agent Dockerfile base image does not match AGENT_BASE_IMAGE." >&2
+        echo "Expected: $expected_from" >&2
+        echo "Actual:   $actual_from" >&2
+        exit 1
+      fi
+
+      trivy image \
+        --timeout 30m \
+        --scanners vuln \
+        --ignore-unfixed \
+        --exit-code 0 \
+        --exit-on-eol 1 \
+        --no-progress \
+        --disable-telemetry \
+        --format json \
+        --output trivy-base-image-report.json \
+        --platform linux/amd64 \
+        "$AGENT_BASE_IMAGE"
+
+      trivy image \
+        --timeout 30m \
+        --skip-db-update \
+        --scanners vuln \
+        --image-config-scanners misconfig \
+        --ignore-unfixed \
+        --exit-code 0 \
+        --exit-on-eol 1 \
+        --no-progress \
+        --disable-telemetry \
+        --format json \
+        --output trivy-image-report.json \
+        --platform linux/amd64 \
+        "${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHA}"
+  artifacts:
+    when: always
+    paths:
+      - trivy-base-image-report.json
+      - trivy-image-report.json
+    expire_in: 1 week
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+security_gate:
+  stage: security_gate
+  needs:
+    - job: secret_scan
+      artifacts: true
+    - job: dependency_scan
+      artifacts: true
+    - job: sast_scan
+      artifacts: true
+    - job: trivy_filesystem_scan
+      artifacts: true
+    - job: trivy_image_scan
+      artifacts: true
+      optional: true
+  script:
+    - |
+      set -eu
+
+      set -- \
+        --policy security-policy.toml \
+        --gitleaks-report gitleaks-report.json \
+        --pip-audit-report pip-audit-report.json \
+        --semgrep-report semgrep-report.json \
+        --trivy-report trivy-filesystem-report.json
+
+      if [ -f trivy-base-image-report.json ] || [ -f trivy-image-report.json ]; then
+        test -f trivy-base-image-report.json
+        test -f trivy-image-report.json
+
+        python ci/trivy_base_delta.py \
+          --base trivy-base-image-report.json \
+          --candidate trivy-image-report.json \
+          --output trivy-image-delta-report.json \
+          --summary trivy-image-delta-summary.json
+
+        set -- "$@" --trivy-report trivy-image-delta-report.json
+      fi
+
+      python -m policy_engine.cli \
+        "$@" \
+        --output security-gate-result.json
+  artifacts:
+    when: always
+    paths:
+      - security-gate-result.json
+      - trivy-image-delta-report.json
+      - trivy-image-delta-summary.json
+    expire_in: 1 week
+
+.deployment_validation:
+  extends: .python_pip_cache
+  stage: deployment_validate
+  needs:
+    - job: security_gate
+      artifacts: true
+  variables:
+    DEPLOYMENT_GATE_REPORT: security-gate-result.json
+  before_script:
+    - python -m pip install .
+  script:
+    - |
+      set -eu
+
+      python -m deployment.ci_gate \
+        --environment "$DEPLOYMENT_TARGET_ENVIRONMENT" \
+        --project-id "$CI_PROJECT_ID" \
+        --pipeline-id "$CI_PIPELINE_ID" \
+        --ref "$CI_COMMIT_REF_NAME" \
+        --commit-sha "$CI_COMMIT_SHA" \
+        --image-repository "$CI_REGISTRY_IMAGE" \
+        --gate-report "$DEPLOYMENT_GATE_REPORT" \
+        --dotenv-output deployment.env
+  artifacts:
+    reports:
+      dotenv: deployment.env
+    paths:
+      - deployment.env
+    expire_in: 1 hour
+
+validate_staging_deployment:
+  extends: .deployment_validation
+  variables:
+    DEPLOYMENT_TARGET_ENVIRONMENT: staging
+  rules:
+    - if: '"$[[ inputs.pipeline_profile ]]" == "full" && "$[[ inputs.deployment_environment ]]" == "staging" && $CI_PIPELINE_SOURCE == "api" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+    - when: never
+
+validate_production_deployment:
+  extends: .deployment_validation
+  variables:
+    DEPLOYMENT_TARGET_ENVIRONMENT: production
+  rules:
+    - if: '"$[[ inputs.pipeline_profile ]]" == "full" && "$[[ inputs.deployment_environment ]]" == "production" && $CI_PIPELINE_SOURCE == "api" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+    - when: never
+
+.deployment_compose:
+  stage: deploy
+  image:
+    name: "docker@sha256:000bb62ff495f986c9f5578eb67cc2cb98b91138eda81d7762d5371eb8a497fe"
+    entrypoint: [""]
+  interruptible: false
+  variables:
+    DEPLOYMENT_SSH_PORT: "22"
+  before_script:
+    - |
+      set -eu
+
+      test -n "$DEPLOYMENT_ENVIRONMENT"
+      test -n "$DEPLOYMENT_IMAGE_REPOSITORY"
+      test -n "$DEPLOYMENT_COMMIT_SHA"
+      test -n "$DEPLOYMENT_SSH_HOST"
+      test -n "$DEPLOYMENT_SSH_USER"
+      test -f "$DEPLOYMENT_SSH_PRIVATE_KEY"
+      test -f "$DEPLOYMENT_SSH_KNOWN_HOSTS"
+      test -f "$DEPLOYMENT_API_ENV_FILE"
+      test -f "$DEPLOYMENT_BOT_ENV_FILE"
+
+      umask 077
+      mkdir -p "$HOME/.ssh"
+      cp "$DEPLOYMENT_SSH_PRIVATE_KEY" "$HOME/.ssh/id_ed25519"
+      cp "$DEPLOYMENT_SSH_KNOWN_HOSTS" "$HOME/.ssh/known_hosts"
+      chmod 600 \
+        "$HOME/.ssh/id_ed25519" \
+        "$HOME/.ssh/known_hosts"
+
+      printf '%s\n' \
+        "Host deployment-target" \
+        "  HostName ${DEPLOYMENT_SSH_HOST}" \
+        "  User ${DEPLOYMENT_SSH_USER}" \
+        "  Port ${DEPLOYMENT_SSH_PORT}" \
+        "  IdentityFile ${HOME}/.ssh/id_ed25519" \
+        "  IdentitiesOnly yes" \
+        "  BatchMode yes" \
+        "  StrictHostKeyChecking yes" \
+        "  UserKnownHostsFile ${HOME}/.ssh/known_hosts" \
+        "  ConnectTimeout 10" \
+        > "$HOME/.ssh/config"
+
+      chmod 600 "$HOME/.ssh/config"
+
+      export DOCKER_HOST="ssh://deployment-target"
+
+      docker info >/dev/null
+
+      printf '%s' "$CI_REGISTRY_PASSWORD" |
+        docker login \
+          --username "$CI_REGISTRY_USER" \
+          --password-stdin \
+          "$CI_REGISTRY"
+  script:
+    - sh deployment/release.sh
+  artifacts:
+    when: always
+    access: maintainer
+    paths:
+      - deployment-result.json
+    expire_in: 1 week
+deploy_staging:
+  extends: .deployment_compose
+  needs:
+    - job: validate_staging_deployment
+      artifacts: true
+  variables:
+    DEPLOYMENT_COMPOSE_OVERRIDE: deployment/compose.staging.yml
+    DEPLOYMENT_API_ENV_FILE: "$STAGING_API_ENV_FILE"
+    DEPLOYMENT_BOT_ENV_FILE: "$STAGING_BOT_ENV_FILE"
+  environment:
+    name: staging
+    deployment_tier: staging
+  resource_group: staging
+  rules:
+    - if: '"$[[ inputs.pipeline_profile ]]" == "full" && "$[[ inputs.deployment_environment ]]" == "staging" && $CI_PIPELINE_SOURCE == "api" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+    - when: never
+
+
+deploy_staging_monitoring:
+  extends: .deployment_compose
+  stage: monitoring_deploy
+  needs:
+    - job: validate_staging_deployment
+      artifacts: true
+    - job: deploy_staging
+      artifacts: false
+  variables:
+    DEPLOYMENT_COMPOSE_OVERRIDE: deployment/compose.staging.yml
+    DEPLOYMENT_API_ENV_FILE: "$STAGING_API_ENV_FILE"
+    DEPLOYMENT_BOT_ENV_FILE: "$STAGING_BOT_ENV_FILE"
+  script:
+    - sh deployment/monitoring.sh
+  artifacts:
+    when: always
+    access: maintainer
+    paths:
+      - monitoring-result.json
+    expire_in: 1 week
+  environment:
+    name: staging
+    action: verify
+  resource_group: staging
+  rules:
+    - if: '"$[[ inputs.pipeline_profile ]]" == "full" && "$[[ inputs.deployment_environment ]]" == "staging" && $CI_PIPELINE_SOURCE == "api" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+    - when: never
+
+deploy_production:
+  extends: .deployment_compose
+  needs:
+    - job: validate_production_deployment
+      artifacts: true
+  variables:
+    DEPLOYMENT_COMPOSE_OVERRIDE: deployment/compose.production.yml
+    DEPLOYMENT_API_ENV_FILE: "$PRODUCTION_API_ENV_FILE"
+    DEPLOYMENT_BOT_ENV_FILE: "$PRODUCTION_BOT_ENV_FILE"
+  environment:
+    name: production
+    deployment_tier: production
+  resource_group: production
+  rules:
+    - if: '"$[[ inputs.pipeline_profile ]]" == "full" && "$[[ inputs.deployment_environment ]]" == "production" && $CI_PIPELINE_SOURCE == "api" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+    - when: never

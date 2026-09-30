@@ -1,0 +1,155 @@
+x-service-hardening: &service-hardening
+  image: "${DEPLOYMENT_IMAGE_REPOSITORY:?DEPLOYMENT_IMAGE_REPOSITORY is required}:${DEPLOYMENT_COMMIT_SHA:?DEPLOYMENT_COMMIT_SHA is required}"
+  pull_policy: always
+  user: "10001:10001"
+  read_only: true
+  init: true
+  restart: unless-stopped
+  stop_grace_period: 20s
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 128
+  cpus: 1.0
+  mem_limit: 512m
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=64m
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  api:
+    <<: *service-hardening
+    command:
+      - python
+      - -m
+      - uvicorn
+      - sample_app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --no-access-log
+    expose:
+      - "8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2).close()
+      interval: 15s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    networks:
+      - api_egress
+      - monitoring
+
+  bot:
+    <<: *service-hardening
+    command:
+      - python
+      - -m
+      - bot
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - kill -0 1
+      interval: 30s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    networks:
+      - bot_egress
+
+
+  prometheus:
+    image: "prom/prometheus:v3.13.2"
+    profiles:
+      - monitoring
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    cpus: 0.5
+    mem_limit: 512m
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.listen-address=0.0.0.0:9090
+    expose:
+      - "9090"
+    volumes:
+      - prometheus_config:/etc/prometheus:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - monitoring
+
+  alertmanager:
+    image: prom/alertmanager:v0.33.1
+    profiles:
+      - monitoring
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    cpus: 0.25
+    mem_limit: 256m
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --enable-feature=utf8-strict-mode
+      - --storage.path=/alertmanager
+      - --web.listen-address=0.0.0.0:9093
+    volumes:
+      - alertmanager_config:/etc/alertmanager:ro
+      - alertmanager_data:/alertmanager
+    tmpfs:
+      - /tmp
+    expose:
+      - "9093"
+    networks:
+      - monitoring
+
+networks:
+  api_egress:
+    driver: bridge
+  bot_egress:
+    driver: bridge
+  monitoring:
+    driver: bridge
+    internal: true
+
+volumes:
+  prometheus_data:
+  prometheus_config:
+  alertmanager_config:
+  alertmanager_data:

@@ -1,0 +1,22 @@
+{
+  "errors": [],
+  "results": [
+    {
+      "check_id": "fixture.safe-info-rule",
+      "path": "sample_app/main.py",
+      "start": {
+        "line": 1
+      },
+      "extra": {
+        "message": "Controlled informational fixture",
+        "severity": "INFO",
+        "is_ignored": false
+      }
+    }
+  ],
+  "paths": {
+    "scanned": [
+      "sample_app/main.py"
+    ]
+  }
+}

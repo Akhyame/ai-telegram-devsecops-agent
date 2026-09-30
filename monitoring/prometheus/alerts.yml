@@ -1,0 +1,94 @@
+groups:
+  - name: sample-app-alerts
+    rules:
+      - alert: SampleAppUnavailable
+        expr: up{job="sample-app"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: sample-app
+        annotations:
+          summary: Sample application is unavailable.
+          description: Prometheus cannot scrape the sample application target.
+
+      - alert: SampleAppHighServerErrors
+        expr: |
+          (
+            sum(rate(sample_app_http_requests_total{status_code=~"5.."}[5m]))
+            /
+            sum(rate(sample_app_http_requests_total[5m]))
+          ) > 0.05
+          and
+          sum(rate(sample_app_http_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          service: sample-app
+        annotations:
+          summary: Sample application server-error rate is elevated.
+          description: HTTP 5xx responses exceeded 5 percent during sustained request traffic.
+
+      - alert: SampleAppHighLatency
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (
+              rate(sample_app_http_request_duration_seconds_bucket[5m])
+            )
+          ) > 1
+          and
+          sum(rate(sample_app_http_request_duration_seconds_count[5m])) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          service: sample-app
+        annotations:
+          summary: Sample application latency is elevated.
+          description: The sustained HTTP request p95 latency exceeded one second.
+
+  - name: real-fastapi-staging-alerts
+    rules:
+      - alert: RealFastAPIUnavailable
+        expr: up{job="real-fastapi-staging"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: real-fastapi-staging
+        annotations:
+          summary: Real FastAPI staging is unavailable
+          description: Prometheus cannot scrape the real FastAPI staging service.
+
+      - alert: RealFastAPIHighServerErrors
+        expr: |
+          (
+            sum(rate(real_fastapi_http_requests_total{status_code=~"5.."}[5m]))
+            /
+            sum(rate(real_fastapi_http_requests_total[5m]))
+          ) > 0.05
+          and
+          sum(rate(real_fastapi_http_requests_total[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          service: real-fastapi-staging
+        annotations:
+          summary: Real FastAPI staging has a high server error rate
+          description: More than five percent of sustained HTTP traffic is returning 5xx responses.
+
+      - alert: RealFastAPIHighLatency
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (
+              rate(real_fastapi_http_request_duration_seconds_bucket[5m])
+            )
+          ) > 1
+          and
+          sum(rate(real_fastapi_http_request_duration_seconds_count[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+          service: real-fastapi-staging
+        annotations:
+          summary: Real FastAPI staging has high latency
+          description: Sustained p95 HTTP request latency is above one second.

@@ -1,0 +1,11 @@
+[
+  {
+    "RuleID": "fixture-secret-rule",
+    "Description": "Controlled fixture secret detection",
+    "File": "config/example.env",
+    "StartLine": 4,
+    "Secret": "fixture-secret-value",
+    "Match": "fixture-match-value",
+    "Line": "TOKEN=fixture-secret-value"
+  }
+]
